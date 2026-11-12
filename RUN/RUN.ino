@@ -1,921 +1,192 @@
-#include <Arduino.h>
+// MEDBOT ROVER - 4WD BTS7960 + ESP32-S3 - WiFi joystick control
+// ESP32 Arduino core 3.x   |   Serial Monitor: 115200
+// WiFi AP: "MedbotRover" / "12345678"  ->  open http://192.168.4.1
+
 #include <WiFi.h>
 #include <WebServer.h>
 
-// ============================================================
-// WIFI ACCESS POINT
-// ============================================================
+// ---------- Motor table (matches your physical wiring) ----------
+struct Motor {
+  const char* name;
+  int ren, len, rpwm, lpwm;
+  bool invert;            // true if RPWM spins this wheel backward
+};
 
-const char* AP_SSID = "ESP32_ROVER";
-const char* AP_PASSWORD = "12345678";
+Motor motors[] = {
+  //  name  R_EN L_EN RPWM LPWM invert
+  {"FL",   1,   2,   4,   5,  false},
+  {"FR",  10,  11,  12,  13,  false },
+  {"RL",   6,   7,   8,   9,  false},
+  {"RR",  15,  16,  17,  18,  true }
+};
+const int MOTOR_COUNT = 4;
+const int FL = 0, FR = 1, RL = 2, RR = 3;
+
+// ---------- Settings ----------
+const uint32_t PWM_FREQ = 20000;
+const uint8_t  PWM_RES  = 8;
+const char* AP_SSID = "MedbotRover";
+const char* AP_PASS = "12345678";
+
+const unsigned long FAILSAFE_MS = 500;
+const float DEADZONE   = 0.08;
+const float RAMP_STEP  = 0.06;
+const unsigned long RAMP_INTERVAL_MS = 20;
 
 WebServer server(80);
 
-// ============================================================
-// BTS7960 PIN MAP
-// ============================================================
-
-// Front Left
-const int FL_REN  = 1;
-const int FL_LEN  = 2;
-const int FL_RPWM = 4;
-const int FL_LPWM = 5;
-
-// Front Right
-const int FR_REN  = 6;
-const int FR_LEN  = 7;
-const int FR_RPWM = 8;
-const int FR_LPWM = 9;
-
-// Rear Left
-const int RL_REN  = 10;
-const int RL_LEN  = 11;
-const int RL_RPWM = 12;
-const int RL_LPWM = 13;
-
-// Rear Right
-const int RR_REN  = 14;
-const int RR_LEN  = 15;
-const int RR_RPWM = 16;
-const int RR_LPWM = 17;
-
-// ============================================================
-// PWM
-// ============================================================
-
-const int PWM_FREQUENCY = 1000;
-const int PWM_RESOLUTION = 8;
-
-// ============================================================
-// SPEED
-// ============================================================
-
-int roverSpeed = 160;
-
-String currentMotion = "STOP";
-
-unsigned long lastCommand = 0;
-
-const unsigned long SAFETY_TIMEOUT = 1500;
-
-// ============================================================
-// MOTOR SETUP
-// ============================================================
-
-void setupMotor(
-  int ren,
-  int len,
-  int rpwm,
-  int lpwm
-) {
-
-  pinMode(ren, OUTPUT);
-  pinMode(len, OUTPUT);
-
-  digitalWrite(ren, HIGH);
-  digitalWrite(len, HIGH);
-
-  // Arduino ESP32 Core 3.x
-  ledcAttach(
-    rpwm,
-    PWM_FREQUENCY,
-    PWM_RESOLUTION
-  );
-
-  ledcAttach(
-    lpwm,
-    PWM_FREQUENCY,
-    PWM_RESOLUTION
-  );
-
-  ledcWrite(rpwm, 0);
-  ledcWrite(lpwm, 0);
-}
-
-// ============================================================
-// STOP ONE MOTOR
-// ============================================================
-
-void stopMotor(
-  int rpwm,
-  int lpwm
-) {
-
-  ledcWrite(rpwm, 0);
-  ledcWrite(lpwm, 0);
-}
-
-// ============================================================
-// FORWARD ONE MOTOR
-// ============================================================
-
-void forwardMotor(
-  int rpwm,
-  int lpwm,
-  int speed
-) {
-
-  ledcWrite(rpwm, speed);
-  ledcWrite(lpwm, 0);
-}
-
-// ============================================================
-// REVERSE ONE MOTOR
-// ============================================================
-
-void reverseMotor(
-  int rpwm,
-  int lpwm,
-  int speed
-) {
-
-  ledcWrite(rpwm, 0);
-  ledcWrite(lpwm, speed);
-}
-
-// ============================================================
-// STOP ALL
-// ============================================================
-
-void stopAllMotors() {
-
-  stopMotor(FL_RPWM, FL_LPWM);
-  stopMotor(FR_RPWM, FR_LPWM);
-  stopMotor(RL_RPWM, RL_LPWM);
-  stopMotor(RR_RPWM, RR_LPWM);
-
-  currentMotion = "STOP";
-}
-
-// ============================================================
-// FORWARD
-// ============================================================
-
-void roverForward() {
-
-  forwardMotor(
-    FL_RPWM,
-    FL_LPWM,
-    roverSpeed
-  );
-
-  forwardMotor(
-    FR_RPWM,
-    FR_LPWM,
-    roverSpeed
-  );
-
-  forwardMotor(
-    RL_RPWM,
-    RL_LPWM,
-    roverSpeed
-  );
-
-  forwardMotor(
-    RR_RPWM,
-    RR_LPWM,
-    roverSpeed
-  );
-
-  currentMotion = "FORWARD";
-}
-
-// ============================================================
-// REVERSE
-// ============================================================
-
-void roverReverse() {
-
-  reverseMotor(
-    FL_RPWM,
-    FL_LPWM,
-    roverSpeed
-  );
-
-  reverseMotor(
-    FR_RPWM,
-    FR_LPWM,
-    roverSpeed
-  );
-
-  reverseMotor(
-    RL_RPWM,
-    RL_LPWM,
-    roverSpeed
-  );
-
-  reverseMotor(
-    RR_RPWM,
-    RR_LPWM,
-    roverSpeed
-  );
-
-  currentMotion = "REVERSE";
-}
-
-// ============================================================
-// LEFT
-// ============================================================
-
-void roverLeft() {
-
-  reverseMotor(
-    FL_RPWM,
-    FL_LPWM,
-    roverSpeed
-  );
-
-  reverseMotor(
-    RL_RPWM,
-    RL_LPWM,
-    roverSpeed
-  );
-
-  forwardMotor(
-    FR_RPWM,
-    FR_LPWM,
-    roverSpeed
-  );
-
-  forwardMotor(
-    RR_RPWM,
-    RR_LPWM,
-    roverSpeed
-  );
-
-  currentMotion = "LEFT";
-}
-
-// ============================================================
-// RIGHT
-// ============================================================
-
-void roverRight() {
-
-  forwardMotor(
-    FL_RPWM,
-    FL_LPWM,
-    roverSpeed
-  );
-
-  forwardMotor(
-    RL_RPWM,
-    RL_LPWM,
-    roverSpeed
-  );
-
-  reverseMotor(
-    FR_RPWM,
-    FR_LPWM,
-    roverSpeed
-  );
-
-  reverseMotor(
-    RR_RPWM,
-    RR_LPWM,
-    roverSpeed
-  );
-
-  currentMotion = "RIGHT";
-}
-
-// ============================================================
-// WEBPAGE
-// ============================================================
-
-const char MAIN_PAGE[] PROGMEM = R"HTML(
-
-<!DOCTYPE html>
-
-<html>
-
-<head>
-
-<meta name="viewport"
-content="width=device-width, initial-scale=1">
-
-<title>ESP32 Rover</title>
-
-<style>
-
-body {
-  background:#111;
-  color:white;
-  font-family:Arial;
-  text-align:center;
-  margin:0;
-}
-
-.container {
-  max-width:500px;
-  margin:auto;
-  padding:20px;
-}
-
-h1 {
-  font-size:28px;
-}
-
-.status {
-  background:#222;
-  border-radius:15px;
-  padding:15px;
-  margin-bottom:20px;
-}
-
-#motion {
-  font-size:28px;
-  font-weight:bold;
-  margin:10px;
-}
-
-.connected {
-  color:#00ff66;
-}
-
-.speedBox {
-  background:#222;
-  padding:15px;
-  border-radius:15px;
-  margin-bottom:20px;
-}
-
-input {
-  width:90%;
-}
-
-.speedValue {
-  font-size:22px;
-  margin-top:10px;
-}
-
-.controls {
-  display:grid;
-  grid-template-columns:1fr 1fr 1fr;
-  gap:12px;
-}
-
-button {
-  height:80px;
-  border:none;
-  border-radius:18px;
-  background:#333;
-  color:white;
-  font-size:25px;
-  font-weight:bold;
-  touch-action:none;
-}
-
-button:active {
-  transform:scale(.95);
-}
-
-.forward {
-  grid-column:2;
-}
-
-.left {
-  grid-column:1;
-  grid-row:2;
-}
-
-.stop {
-  grid-column:2;
-  grid-row:2;
-  background:#c00020;
-}
-
-.right {
-  grid-column:3;
-  grid-row:2;
-}
-
-.reverse {
-  grid-column:2;
-  grid-row:3;
-}
-
-.motors {
-  display:grid;
-  grid-template-columns:1fr 1fr;
-  gap:10px;
-  margin-top:20px;
-}
-
-.motor {
-  background:#222;
-  border-radius:12px;
-  padding:15px;
-}
-
-</style>
-
-</head>
-
-<body>
-
-<div class="container">
-
-<h1>🚙 ESP32-S3 ROVER</h1>
-
-<div class="status">
-
-<div>Motion</div>
-
-<div id="motion">
-STOP
-</div>
-
-<div class="connected">
-● ESP32 Connected
-</div>
-
-</div>
-
-<div class="speedBox">
-
-<h3>Speed</h3>
-
-<input
-type="range"
-min="0"
-max="255"
-value="160"
-oninput="setSpeed(this.value)">
-
-<div class="speedValue">
-
-<span id="speed">
-63
-</span>%
-
-</div>
-
-</div>
-
-<div class="controls">
-
-<button
-class="forward"
-onpointerdown="start('forward')"
-onpointerup="stop()"
-onpointercancel="stop()">
-▲
-</button>
-
-<button
-class="left"
-onpointerdown="start('left')"
-onpointerup="stop()"
-onpointercancel="stop()">
-◀
-</button>
-
-<button
-class="stop"
-onclick="send('stop')">
-STOP
-</button>
-
-<button
-class="right"
-onpointerdown="start('right')"
-onpointerup="stop()"
-onpointercancel="stop()">
-▶
-</button>
-
-<button
-class="reverse"
-onpointerdown="start('reverse')"
-onpointerup="stop()"
-onpointercancel="stop()">
-▼
-</button>
-
-</div>
-
-<div class="motors">
-
-<div class="motor">
-<b>FL</b><br>
-Front Left<br>
-<span id="fl">STOP</span>
-</div>
-
-<div class="motor">
-<b>FR</b><br>
-Front Right<br>
-<span id="fr">STOP</span>
-</div>
-
-<div class="motor">
-<b>RL</b><br>
-Rear Left<br>
-<span id="rl">STOP</span>
-</div>
-
-<div class="motor">
-<b>RR</b><br>
-Rear Right<br>
-<span id="rr">STOP</span>
-</div>
-
-</div>
-
-</div>
-
-<script>
-
-let timer = null;
-
-function send(command) {
-
-  fetch("/cmd?move=" + command);
-
-  let state =
-    command.toUpperCase();
-
-  document.getElementById("motion")
-    .innerText = state;
-
-  document.getElementById("fl")
-    .innerText = state;
-
-  document.getElementById("fr")
-    .innerText = state;
-
-  document.getElementById("rl")
-    .innerText = state;
-
-  document.getElementById("rr")
-    .innerText = state;
-}
-
-function start(command) {
-
-  send(command);
-
-  if (timer)
-    clearInterval(timer);
-
-  timer = setInterval(
-    function() {
-      send(command);
-    },
-    300
-  );
-}
-
-function stop() {
-
-  if (timer) {
-
-    clearInterval(timer);
-
-    timer = null;
-  }
-
-  send("stop");
-}
-
-function setSpeed(value) {
-
-  let percent =
-    Math.round(
-      value * 100 / 255
-    );
-
-  document.getElementById("speed")
-    .innerText = percent;
-
-  fetch(
-    "/speed?value=" + value
-  );
-}
-
-</script>
-
-</body>
-
-</html>
-
-)HTML";
-
-// ============================================================
-// WEB ROOT
-// ============================================================
-
-void handleRoot() {
-
-  server.send(
-    200,
-    "text/html",
-    MAIN_PAGE
-  );
-}
-
-// ============================================================
-// COMMAND HANDLER
-// ============================================================
-
-void handleCommand() {
-
-  if (!server.hasArg("move")) {
-
-    server.send(
-      400,
-      "text/plain",
-      "Missing move command"
-    );
-
-    return;
-  }
-
-  String command =
-    server.arg("move");
-
-  lastCommand = millis();
-
-  if (command == "forward") {
-
-    roverForward();
-
-  } else if (command == "reverse") {
-
-    roverReverse();
-
-  } else if (command == "left") {
-
-    roverLeft();
-
-  } else if (command == "right") {
-
-    roverRight();
-
+float targetL = 0, targetR = 0;
+float curL = 0, curR = 0;
+unsigned long lastCmd = 0;
+unsigned long lastRamp = 0;
+
+// ---------- Motor control ----------
+void setMotor(int i, float speed) {
+  speed = constrain(speed, -1.0f, 1.0f);
+  if (motors[i].invert) speed = -speed;
+  int duty = (int)(fabs(speed) * 255.0f);
+  if (speed >= 0) {
+    ledcWrite(motors[i].lpwm, 0);
+    ledcWrite(motors[i].rpwm, duty);
   } else {
-
-    stopAllMotors();
+    ledcWrite(motors[i].rpwm, 0);
+    ledcWrite(motors[i].lpwm, duty);
   }
-
-  server.send(
-    200,
-    "text/plain",
-    "OK"
-  );
 }
 
-// ============================================================
-// SPEED HANDLER
-// ============================================================
-
-void handleSpeed() {
-
-  if (!server.hasArg("value")) {
-
-    server.send(
-      400,
-      "text/plain",
-      "Missing speed"
-    );
-
-    return;
-  }
-
-  roverSpeed =
-    constrain(
-      server.arg("value").toInt(),
-      0,
-      255
-    );
-
-  server.send(
-    200,
-    "text/plain",
-    "OK"
-  );
+void applySides(float l, float r) {
+  setMotor(FL, l); setMotor(RL, l);
+  setMotor(FR, r); setMotor(RR, r);
 }
 
-// ============================================================
-// 404
-// ============================================================
-
-void handleNotFound() {
-
-  server.send(
-    404,
-    "text/plain",
-    "Page not found"
-  );
+void stopNow() {
+  targetL = targetR = curL = curR = 0;
+  applySides(0, 0);
 }
 
-// ============================================================
-// SETUP
-// ============================================================
+float stepToward(float cur, float tgt) {
+  if (cur < tgt) return min(cur + RAMP_STEP, tgt);
+  if (cur > tgt) return max(cur - RAMP_STEP, tgt);
+  return cur;
+}
 
+// ---------- Web page ----------
+const char PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Medbot Rover</title>
+<style>
+ body{margin:0;background:#111;color:#eee;font-family:sans-serif;text-align:center;touch-action:none;user-select:none}
+ #pad{width:260px;height:260px;border-radius:50%;background:#222;margin:25px auto;position:relative;border:2px solid #444}
+ #knob{width:90px;height:90px;border-radius:50%;background:#3a8;position:absolute;left:85px;top:85px}
+ input[type=range]{width:80%}
+ button{background:#c33;color:#fff;border:0;border-radius:8px;padding:14px 40px;font-size:18px;margin:10px}
+</style></head><body>
+<h2>Medbot Rover</h2>
+<div id="pad"><div id="knob"></div></div>
+<p id="s">x:0.00 y:0.00</p>
+<p>Max speed: <span id="sv">60</span>%<br>
+<input id="spd" type="range" min="10" max="100" value="60"></p>
+<button id="stop">STOP</button>
+<script>
+const pad=document.getElementById('pad'),knob=document.getElementById('knob'),
+      s=document.getElementById('s'),spd=document.getElementById('spd'),sv=document.getElementById('sv');
+let x=0,y=0,active=false;
+spd.oninput=()=>{sv.textContent=spd.value;};
+function upd(e){
+  const r=pad.getBoundingClientRect(),t=e.touches?e.touches[0]:e;
+  let dx=(t.clientX-r.left-130)/130, dy=(t.clientY-r.top-130)/130;
+  const m=Math.hypot(dx,dy); if(m>1){dx/=m;dy/=m;}
+  x=dx; y=-dy;
+  knob.style.left=(85+dx*85)+'px'; knob.style.top=(85+dy*85)+'px';
+}
+function end(){active=false;x=0;y=0;knob.style.left='85px';knob.style.top='85px';send();}
+pad.addEventListener('touchstart',e=>{active=true;upd(e);e.preventDefault()});
+pad.addEventListener('touchmove',e=>{upd(e);e.preventDefault()});
+pad.addEventListener('touchend',end);
+pad.addEventListener('touchcancel',end);
+pad.addEventListener('mousedown',e=>{active=true;upd(e)});
+window.addEventListener('mousemove',e=>{if(active)upd(e)});
+window.addEventListener('mouseup',()=>{if(active)end();});
+document.getElementById('stop').onclick=()=>{end();fetch('/stop').catch(()=>{});};
+function send(){
+  const k=spd.value/100, sx=x*k, sy=y*k;
+  s.textContent='x:'+sx.toFixed(2)+' y:'+sy.toFixed(2);
+  fetch('/drive?x='+sx.toFixed(2)+'&y='+sy.toFixed(2)).catch(()=>{});
+}
+setInterval(()=>{if(active)send();},100);
+</script></body></html>
+)rawliteral";
+
+// ---------- Setup ----------
 void setup() {
-
   Serial.begin(115200);
-
-  delay(1000);
-
-  Serial.println();
-  Serial.println(
-    "================================="
-  );
-  Serial.println(
-    " ESP32-S3 4WD ROVER"
-  );
-  Serial.println(
-    " 4 x BTS7960"
-  );
-  Serial.println(
-    " WiFi ACCESS POINT"
-  );
-  Serial.println(
-    "================================="
-  );
-
-
-  // ----------------------------------------------------------
-  // MOTORS
-  // ----------------------------------------------------------
-
-  setupMotor(
-    FL_REN,
-    FL_LEN,
-    FL_RPWM,
-    FL_LPWM
-  );
-
-  setupMotor(
-    FR_REN,
-    FR_LEN,
-    FR_RPWM,
-    FR_LPWM
-  );
-
-  setupMotor(
-    RL_REN,
-    RL_LEN,
-    RL_RPWM,
-    RL_LPWM
-  );
-
-  setupMotor(
-    RR_REN,
-    RR_LEN,
-    RR_RPWM,
-    RR_LPWM
-  );
-
-  stopAllMotors();
-
-
-  Serial.println(
-    "Motors initialized"
-  );
-
-
-  // ----------------------------------------------------------
-  // WIFI ACCESS POINT
-  // ----------------------------------------------------------
-
-  WiFi.mode(WIFI_AP);
-
   delay(500);
 
-  bool result =
-    WiFi.softAP(
-      AP_SSID,
-      AP_PASSWORD
-    );
-
-  if (result) {
-
-    Serial.println();
-    Serial.println(
-      "WiFi AP started"
-    );
-
-    Serial.print(
-      "SSID: "
-    );
-
-    Serial.println(
-      AP_SSID
-    );
-
-    Serial.print(
-      "Password: "
-    );
-
-    Serial.println(
-      AP_PASSWORD
-    );
-
-    Serial.print(
-      "IP: "
-    );
-
-    Serial.println(
-      WiFi.softAPIP()
-    );
-
-  } else {
-
-    Serial.println(
-      "ERROR: WiFi AP FAILED"
-    );
+  for (int i = 0; i < MOTOR_COUNT; i++) {
+    pinMode(motors[i].ren, OUTPUT);
+    pinMode(motors[i].len, OUTPUT);
+    digitalWrite(motors[i].ren, LOW);
+    digitalWrite(motors[i].len, LOW);
+    ledcAttach(motors[i].rpwm, PWM_FREQ, PWM_RES);
+    ledcAttach(motors[i].lpwm, PWM_FREQ, PWM_RES);
+    ledcWrite(motors[i].rpwm, 0);
+    ledcWrite(motors[i].lpwm, 0);
+  }
+  delay(300);
+  for (int i = 0; i < MOTOR_COUNT; i++) {
+    digitalWrite(motors[i].ren, HIGH);
+    digitalWrite(motors[i].len, HIGH);
   }
 
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.print("WiFi AP: "); Serial.println(AP_SSID);
+  Serial.print("Open http://"); Serial.println(WiFi.softAPIP());
 
-  // ----------------------------------------------------------
-  // WEB SERVER
-  // ----------------------------------------------------------
+  server.on("/", []() { server.send_P(200, "text/html", PAGE); });
 
-  server.on(
-    "/",
-    HTTP_GET,
-    handleRoot
-  );
+  server.on("/drive", []() {
+    float x = server.arg("x").toFloat();   // turn: + = right
+    float y = server.arg("y").toFloat();   // forward: + = up
+    if (fabs(x) < DEADZONE) x = 0;
+    if (fabs(y) < DEADZONE) y = 0;
 
-  server.on(
-    "/cmd",
-    HTTP_GET,
-    handleCommand
-  );
+    // Mixing with scaling (keeps turn ratio instead of clipping)
+    float l = y + x;
+    float r = y - x;
+    float m = max(fabs(l), fabs(r));
+    if (m > 1.0f) { l /= m; r /= m; }
+    targetL = l;
+    targetR = r;
 
-  server.on(
-    "/speed",
-    HTTP_GET,
-    handleSpeed
-  );
+    lastCmd = millis();
+    server.send(200, "text/plain", "ok");
+  });
 
-  server.onNotFound(
-    handleNotFound
-  );
+  server.on("/stop", []() {
+    stopNow();
+    server.send(200, "text/plain", "stopped");
+  });
 
   server.begin();
-
-
-  Serial.println();
-  Serial.println(
-    "Web server started"
-  );
-
-  Serial.println();
-  Serial.println(
-    "Connect to:"
-  );
-
-  Serial.println(
-    "ESP32_ROVER"
-  );
-
-  Serial.println(
-    "Password: 12345678"
-  );
-
-  Serial.println();
-  Serial.println(
-    "Open:"
-  );
-
-  Serial.println(
-    "http://192.168.4.1"
-  );
-
-  Serial.println(
-    "================================="
-  );
-
-  lastCommand = millis();
+  stopNow();
+  lastCmd = millis();
 }
 
-// ============================================================
-// LOOP
-// ============================================================
-
+// ---------- Loop ----------
 void loop() {
-
   server.handleClient();
 
+  if (millis() - lastCmd > FAILSAFE_MS) {
+    if (curL != 0 || curR != 0 || targetL != 0 || targetR != 0) stopNow();
+    return;
+  }
 
-  // ----------------------------------------------------------
-  // SAFETY STOP
-  // ----------------------------------------------------------
-
-  if (
-    currentMotion != "STOP" &&
-    millis() - lastCommand >
-    SAFETY_TIMEOUT
-  ) {
-
-    stopAllMotors();
-
-    Serial.println(
-      "SAFETY STOP"
-    );
+  if (millis() - lastRamp >= RAMP_INTERVAL_MS) {
+    lastRamp = millis();
+    curL = stepToward(curL, targetL);
+    curR = stepToward(curR, targetR);
+    applySides(curL, curR);
   }
 }
